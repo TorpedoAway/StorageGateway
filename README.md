@@ -1,0 +1,2 @@
+# StorageGateway
+Report SG Status
