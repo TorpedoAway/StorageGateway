@@ -1,28 +1,18 @@
 import boto3
 import csv
+import json
 import logging
 from botocore.exceptions import ClientError
 
-# Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
-
-############################################################################################
-# Example Usage...
-# from AWS_SG_MGR import StorageGatewayManager
-#
-# manager = StorageGatewayManager(region_name='us-east-1')
-# gateways = manager.get_detailed_status()
-# Process your gateways here...
-############################################################################################
 
 class StorageGatewayManager:
     def __init__(self, region_name='us-east-1'):
-        """Initializes the boto3 client for Storage Gateway."""
         self.client = boto3.client('storagegateway', region_name=region_name)
         self.region = region_name
 
     def list_all_gateways(self):
-        """Retrieves a list of all gateway ARNs in the region using a paginator."""
+        """Retrieves all gateway ARNs using a paginator."""
         try:
             gateways = []
             paginator = self.client.get_paginator('list_gateways')
@@ -34,15 +24,12 @@ class StorageGatewayManager:
             return []
 
     def get_detailed_status(self):
-        """Returns a list of dictionaries containing detailed info for each gateway."""
+        """Returns high-level metadata for all gateways in the account."""
         gateways = self.list_all_gateways()
         detailed_list = []
-
         for gw in gateways:
             try:
-                info = self.client.describe_gateway_information(
-                    GatewayARN=gw['GatewayARN']
-                )
+                info = self.client.describe_gateway_information(GatewayARN=gw['GatewayARN'])
                 detailed_list.append({
                     'Name': info.get('GatewayName', 'N/A'),
                     'ID': info.get('GatewayId', 'N/A'),
@@ -52,28 +39,85 @@ class StorageGatewayManager:
                 })
             except ClientError as e:
                 logging.warning(f"Could not describe gateway {gw['GatewayARN']}: {e}")
-        
         return detailed_list
 
-    def export_to_csv(self, filename='gateway_report.csv'):
-        """Fetches detailed status and exports it to a CSV file."""
-        data = self.get_detailed_status()
-        if not data:
-            logging.info("No data found to export.")
-            return
+    def _get_share_details(self, share_arns, share_type):
+        """Batches and fetches deep details for specific shares (NFS or SMB)."""
+        details = []
+        # AWS limits describe calls to 10 ARNs at a time
+        for i in range(0, len(share_arns), 10):
+            batch = share_arns[i:i+10]
+            try:
+                if share_type == 'NFS':
+                    response = self.client.describe_nfs_file_shares(FileShareARNList=batch)
+                    details.extend(response.get('NFSFileShareInfoList', []))
+                else:
+                    response = self.client.describe_smb_file_shares(FileShareARNList=batch)
+                    details.extend(response.get('SMBFileShareInfoList', []))
+            except ClientError as e:
+                logging.error(f"Failed to describe {share_type} shares: {e}")
+        return details
 
-        keys = data[0].keys()
-        try:
-            with open(filename, 'w', newline='') as output_file:
-                dict_writer = csv.DictWriter(output_file, fieldnames=keys)
-                dict_writer.writeheader()
-                dict_writer.writerows(data)
-            logging.info(f"Report successfully exported to {filename}")
-        except IOError as e:
-            logging.error(f"Error writing CSV file: {e}")
+    def export_shares_to_json(self, filename='gateway_shares.json'):
+        """
+        Creates a JSON map of gateways and their shares, including 
+        IP allowed lists (NFS) and AD User/Group access (SMB).
+        """
+        gateways = self.get_detailed_status()
+        share_report = {}
+
+        for gw in gateways:
+            if gw['Type'] in ['FILE_S3', 'FILE_FSX_SMB']:
+                logging.info(f"Processing shares for {gw['Name']}...")
+                try:
+                    # 1. List basic share ARNs for this gateway
+                    paginator = self.client.get_paginator('list_file_shares')
+                    shares_info = []
+                    for page in paginator.paginate(GatewayARN=gw['ARN']):
+                        shares_info.extend(page.get('FileShareInfoList', []))
+                    
+                    # 2. Separate ARNs by type for batch describing
+                    nfs_arns = [s['FileShareARN'] for s in shares_info if s['FileShareType'] == 'NFS']
+                    smb_arns = [s['FileShareARN'] for s in shares_info if s['FileShareType'] == 'SMB']
+
+                    # 3. Fetch deep details (Permissions/Access)
+                    full_details = []
+                    
+                    for share in self._get_share_details(nfs_arns, 'NFS'):
+                        full_details.append({
+                            'ShareID': share.get('FileShareId'),
+                            'Type': 'NFS',
+                            'Path': share.get('Path'),
+                            'Bucket': share.get('LocationARN'),
+                            'AllowedClients': share.get('ClientList', []), # IP Ranges
+                            'Status': share.get('FileShareStatus')
+                        })
+
+                    for share in self._get_share_details(smb_arns, 'SMB'):
+                        full_details.append({
+                            'ShareID': share.get('FileShareId'),
+                            'Type': 'SMB',
+                            'Path': share.get('Path'),
+                            'Bucket': share.get('LocationARN'),
+                            'AD_AllowedUsers': share.get('ValidUserList', []),
+                            'AD_AllowedGroups': [u for u in share.get('ValidUserList', []) if u.startswith('@')],
+                            'AD_AdminUsers': share.get('AdminUserList', []),
+                            'Status': share.get('FileShareStatus'),
+                            'SMB_ACL_Enabled': share.get('SMBACLEnabled', False)
+                        })
+
+                    share_report[gw['Name']] = {
+                        'GatewayID': gw['ID'],
+                        'Shares': full_details
+                    }
+
+                except ClientError as e:
+                    logging.error(f"Error gathering share data for {gw['Name']}: {e}")
+
+        with open(filename, 'w') as f:
+            json.dump(share_report, f, indent=4)
+        logging.info(f"Detailed share report saved to {filename}")
 
 if __name__ == "__main__":
     sg_mgr = StorageGatewayManager(region_name='us-east-1')
-    
-    # Run the export
-    sg_mgr.export_to_csv('my_gateways.csv')
+    sg_mgr.export_shares_to_json('comprehensive_shares.json')
